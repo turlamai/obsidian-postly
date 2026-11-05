@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "minAppVersion": "1.4.0",
   "description": "Push the current note to a postly blog repository as pure Markdown. Editor-independent: strips frontmatter, keeps content.",
-  "author": "jrtxio",
+  "author": "turlamai",
   "isDesktopOnly": false
 }
