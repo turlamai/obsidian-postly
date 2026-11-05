@@ -1,0 +1,17 @@
+{
+  "name": "obsidian-postly",
+  "version": "0.1.0",
+  "description": "Push the current note to a postly blog repository as pure Markdown",
+  "main": "main.js",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --external:obsidian --outfile=main.js --format=cjs --target=es2020"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.4.0",
+    "typescript": "^5.4.0",
+    "tslib": "2.6.2"
+  }
+}
