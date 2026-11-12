@@ -13,6 +13,14 @@ never depends on it) and deriving an H1 title from the filename when the body
 has none. Everything else is pushed byte-for-byte; the postly engine does all
 rendering on the build side.
 
+## Identity
+
+The repository and plugin id intentionally differ: the Obsidian manifest id
+is `postly-publisher` (set at first publication — changing it would orphan
+existing installs), while the repository/package name is `obsidian-postly`,
+matching its sibling naming (`obsidian` is the Racket Markdown library this
+plugin does not depend on). The display name is "postly publisher".
+
 ## Setup
 
 1. Settings → postly publisher: repository owner/name, branch, target

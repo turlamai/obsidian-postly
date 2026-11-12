@@ -11,6 +11,13 @@
 1. 设置 → postly publisher：仓库 owner/name、分支、目标目录（文章填 `blog`）、仅对该仓库有 Contents 读写权限的 fine-grained PAT。
 2. 在要发布的笔记里执行命令即可。
 
+## 标识说明
+
+仓库/包名与插件 id 有意不同：Obsidian manifest id 是 `postly-publisher`
+（首次发布时已定，改名会让已装用户失去更新），仓库与包名为
+`obsidian-postly`，与兄弟仓命名一致（`obsidian` 是本插件不依赖的 Racket
+Markdown 库）。插件显示名为 "postly publisher"。
+
 ## 许可
 
 MIT，见 `LICENSE`。
