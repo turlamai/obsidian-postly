@@ -1,5 +1,7 @@
 # obsidian-postly
 
+**Support:** [Issues & feedback](https://github.com/turlamai/obsidian-postly/issues) · [Development policy](https://github.com/turlamai/turlamai.github.io/blob/master/PORTFOLIO.md)
+
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 A deliberately thin Obsidian plugin: push the current note's **pure
