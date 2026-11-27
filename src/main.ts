@@ -19,6 +19,7 @@ interface PostlySettings {
   token: string;
   stripFrontmatter: boolean;
   publishedPaths?: Record<string, string>;
+  publishedShas?: Record<string, string>;
 }
 
 const DEFAULT_SETTINGS: PostlySettings = {
@@ -47,6 +48,11 @@ export default class PostlyPlugin extends Plugin {
         return true;
       },
     });
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      void this.reconcileRename(oldPath, file.path).catch(() => {
+        new Notice("postly: could not save renamed publication mapping");
+      });
+    }));
     this.addSettingTab(new PostlySettingTab(this.app, this));
   }
 
@@ -56,6 +62,33 @@ export default class PostlyPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  private async reconcileRename(oldPath: string, newPath: string) {
+    const paths = { ...this.settings.publishedPaths };
+    const shas = { ...this.settings.publishedShas };
+    let changed = false;
+    for (const key of Object.keys(paths)) {
+      const parts = JSON.parse(key) as string[];
+      const source = parts[4];
+      if (source !== oldPath && !source.startsWith(oldPath + "/")) continue;
+      parts[4] = newPath + source.slice(oldPath.length);
+      const replacement = JSON.stringify(parts);
+      if (paths[replacement] !== undefined) {
+        new Notice("postly: rename conflicts with another publication mapping");
+        continue;
+      }
+      paths[replacement] = paths[key];
+      if (shas[key]) shas[replacement] = shas[key];
+      delete paths[key];
+      delete shas[key];
+      changed = true;
+    }
+    if (changed) {
+      this.settings.publishedPaths = paths;
+      this.settings.publishedShas = shas;
+      await this.saveSettings();
+    }
   }
 
   private async pushCurrentNote(view: MarkdownView) {
@@ -73,7 +106,8 @@ export default class PostlyPlugin extends Plugin {
       if (dir.split("/").some(part => !part || part === "." || part === "..")) {
         throw new Error("Invalid target directory");
       }
-      const key = JSON.stringify([settings.owner, settings.repo, settings.branch, dir, file.path]);
+      const sourcePath = file.path;
+      const key = JSON.stringify([settings.owner, settings.repo, settings.branch, dir, sourcePath]);
       const existing = settings.publishedPaths?.[key];
       const now = new Date();
       const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
@@ -84,10 +118,13 @@ export default class PostlyPlugin extends Plugin {
         new PublishConfirmModal(this.app, path, Boolean(existing), resolve).open();
       });
       if (!accepted) return;
-      const url = await this.putContents(path, body, settings, Boolean(existing));
-      this.settings.publishedPaths = { ...this.settings.publishedPaths, [key]: path };
+      if (file.path !== sourcePath) throw new Error("Note moved during confirmation; retry publication");
+      const result = await this.putContents(path, body, settings, settings.publishedShas?.[key], Boolean(existing));
+      const currentKey = JSON.stringify([settings.owner, settings.repo, settings.branch, dir, file.path]);
+      this.settings.publishedPaths = { ...this.settings.publishedPaths, [currentKey]: path };
+      this.settings.publishedShas = { ...this.settings.publishedShas, [currentKey]: result.sha };
       await this.saveSettings();
-      new Notice(`postly: committed ✓ ${url ?? ""} (site deployment not verified)`);
+      new Notice(`postly: committed ✓ ${result.url ?? ""} (site deployment not verified)`);
     } catch (e) {
       new Notice(`postly: push failed — ${String(e)}`);
     } finally {
@@ -109,7 +146,7 @@ export default class PostlyPlugin extends Plugin {
   }
 
   /** GitHub Contents API PUT; returns the commit HTML URL when present. */
-  private async putContents(path: string, content: string, settings: PostlySettings, known: boolean): Promise<string | undefined> {
+  private async putContents(path: string, content: string, settings: PostlySettings, expectedSha: string | undefined, known: boolean): Promise<{ sha: string; url?: string }> {
     const { owner, repo, branch, token } = settings;
     const api = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
     const headers = {
@@ -124,9 +161,11 @@ export default class PostlyPlugin extends Plugin {
     if (get.status === 200) {
       if (!known) throw new Error("Remote path already exists; refusing to overwrite an untracked article");
       sha = get.json?.sha;
-      if (typeof sha !== "string" || !sha) throw new Error("Remote path is not a file");
+      if (get.json?.type !== "file" || typeof sha !== "string" || !sha) throw new Error("Remote path is not a file");
+      if (!expectedSha || sha !== expectedSha) throw new Error("Remote article changed or has no recorded revision; refusing to overwrite");
     }
     else if (get.status !== 404) throw new Error(`GitHub GET ${get.status}`);
+    else if (known) throw new Error("Previously published article is missing remotely; refusing to recreate it automatically");
 
     const put = await requestUrl({
       url: api,
@@ -141,7 +180,9 @@ export default class PostlyPlugin extends Plugin {
       throw: false,
     });
     if (put.status >= 200 && put.status < 300) {
-      return put.json?.commit?.html_url;
+      const savedSha = put.json?.content?.sha;
+      if (typeof savedSha !== "string" || !savedSha) throw new Error("Commit response lacks content revision; check GitHub before retrying");
+      return { sha: savedSha, url: put.json?.commit?.html_url };
     }
     throw new Error(`GitHub PUT ${put.status}: ${put.text?.slice(0, 200)}`);
   }
