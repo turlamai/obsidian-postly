@@ -8,7 +8,7 @@
 //   2. ensure the title: if the body has no H1, one is derived from the file
 //      name so the engine's title rule has something to find.
 
-import { App, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from "obsidian";
+import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from "obsidian";
 
 interface PostlySettings {
   owner: string;
@@ -18,6 +18,7 @@ interface PostlySettings {
   targetDir: string;
   token: string;
   stripFrontmatter: boolean;
+  publishedPaths?: Record<string, string>;
 }
 
 const DEFAULT_SETTINGS: PostlySettings = {
@@ -32,6 +33,8 @@ const DEFAULT_SETTINGS: PostlySettings = {
 export default class PostlyPlugin extends Plugin {
   settings: PostlySettings = DEFAULT_SETTINGS;
 
+  private publishing = false;
+
   async onload() {
     await this.loadSettings();
     this.addCommand({
@@ -39,7 +42,7 @@ export default class PostlyPlugin extends Plugin {
       name: "Push current note to postly blog",
       checkCallback: (checking: boolean) => {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!view) return false;
+        if (!view?.file || this.publishing) return false;
         if (!checking) void this.pushCurrentNote(view);
         return true;
       },
@@ -62,15 +65,33 @@ export default class PostlyPlugin extends Plugin {
       new Notice("postly: set owner / repo / token in settings first");
       return;
     }
-    const raw = await this.app.vault.read(file);
-    const body = this.normalize(raw, file.name);
-    const path = `${this.settings.targetDir}/${file.name}`;
+    if (this.publishing) return;
+    this.publishing = true;
     try {
-      new Notice(`postly: pushing ${file.name}…`);
-      const url = await this.putContents(path, body);
-      new Notice(`postly: pushed ✓ ${url ?? ""}`);
+      const settings = { ...this.settings };
+      const dir = settings.targetDir.replace(/^\/+|\/+$/g, "");
+      if (dir.split("/").some(part => !part || part === "." || part === "..")) {
+        throw new Error("Invalid target directory");
+      }
+      const key = JSON.stringify([settings.owner, settings.repo, settings.branch, dir, file.path]);
+      const existing = settings.publishedPaths?.[key];
+      const now = new Date();
+      const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
+      const name = /^\d{4}-\d{2}-\d{2}-/.test(file.name) ? file.name : date + "-" + file.name;
+      const path = existing ?? dir + "/" + name;
+      const body = this.normalize(view.editor.getValue(), file.name);
+      const accepted = await new Promise<boolean>(resolve => {
+        new PublishConfirmModal(this.app, path, Boolean(existing), resolve).open();
+      });
+      if (!accepted) return;
+      const url = await this.putContents(path, body, settings, Boolean(existing));
+      this.settings.publishedPaths = { ...this.settings.publishedPaths, [key]: path };
+      await this.saveSettings();
+      new Notice(`postly: committed ✓ ${url ?? ""} (site deployment not verified)`);
     } catch (e) {
       new Notice(`postly: push failed — ${String(e)}`);
+    } finally {
+      this.publishing = false;
     }
   }
 
@@ -88,9 +109,9 @@ export default class PostlyPlugin extends Plugin {
   }
 
   /** GitHub Contents API PUT; returns the commit HTML URL when present. */
-  private async putContents(path: string, content: string): Promise<string | undefined> {
-    const { owner, repo, branch, token } = this.settings;
-    const api = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
+  private async putContents(path: string, content: string, settings: PostlySettings, known: boolean): Promise<string | undefined> {
+    const { owner, repo, branch, token } = settings;
+    const api = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
     const headers = {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
@@ -99,8 +120,12 @@ export default class PostlyPlugin extends Plugin {
     };
 
     let sha: string | undefined;
-    const get = await requestUrl({ url: `${api}?ref=${branch}`, headers, throw: false });
-    if (get.status === 200) sha = get.json?.sha;
+    const get = await requestUrl({ url: `${api}?ref=${encodeURIComponent(branch)}`, headers, throw: false });
+    if (get.status === 200) {
+      if (!known) throw new Error("Remote path already exists; refusing to overwrite an untracked article");
+      sha = get.json?.sha;
+      if (typeof sha !== "string" || !sha) throw new Error("Remote path is not a file");
+    }
     else if (get.status !== 404) throw new Error(`GitHub GET ${get.status}`);
 
     const put = await requestUrl({
@@ -119,6 +144,25 @@ export default class PostlyPlugin extends Plugin {
       return put.json?.commit?.html_url;
     }
     throw new Error(`GitHub PUT ${put.status}: ${put.text?.slice(0, 200)}`);
+  }
+}
+
+class PublishConfirmModal extends Modal {
+  private accepted = false;
+  constructor(app: App, private path: string, private update: boolean, private resolve: (value: boolean) => void) {
+    super(app);
+  }
+  onOpen() {
+    this.contentEl.createEl("h2", { text: this.update ? "Update public article?" : "Publish public article?" });
+    this.contentEl.createEl("p", { text: this.path });
+    this.contentEl.createEl("p", { text: "The current note will be sent to GitHub. Review its contents before publishing. Attachments are not yet synchronized." });
+    new Setting(this.contentEl)
+      .addButton(b => b.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton(b => b.setButtonText("Publish").setCta().onClick(() => { this.accepted = true; this.close(); }));
+  }
+  onClose() {
+    this.contentEl.empty();
+    this.resolve(this.accepted);
   }
 }
 
