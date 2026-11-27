@@ -20,6 +20,7 @@ interface PostlySettings {
   stripFrontmatter: boolean;
   publishedPaths?: Record<string, string>;
   publishedShas?: Record<string, string>;
+  withdrawnPaths?: Record<string, boolean>;
 }
 
 const DEFAULT_SETTINGS: PostlySettings = {
@@ -48,6 +49,18 @@ export default class PostlyPlugin extends Plugin {
         return true;
       },
     });
+    this.addCommand({
+      id: "withdraw-current-note",
+      name: "Withdraw current note from postly blog",
+      checkCallback: (checking: boolean) => {
+        const file = this.app.workspace.getActiveViewOfType(MarkdownView)?.file;
+        if (!file || this.publishing) return false;
+        const key = this.publicationKey(this.settings, file.path);
+        if (!this.settings.publishedPaths?.[key] || !this.settings.publishedShas?.[key]) return false;
+        if (!checking) void this.withdrawCurrentNote(file);
+        return true;
+      },
+    });
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       void this.reconcileRename(oldPath, file.path).catch(() => {
         new Notice("postly: could not save renamed publication mapping");
@@ -64,9 +77,52 @@ export default class PostlyPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  private publicationKey(settings: PostlySettings, source: string): string {
+    return JSON.stringify([settings.owner, settings.repo, settings.branch, settings.targetDir.replace(/^\/+|\/+$/g, ""), source]);
+  }
+
+  private async withdrawCurrentNote(file: TFile) {
+    if (this.publishing) return;
+    this.publishing = true;
+    try {
+      const settings = { ...this.settings };
+      const source = file.path;
+      const key = this.publicationKey(settings, source);
+      const path = settings.publishedPaths?.[key];
+      const sha = settings.publishedShas?.[key];
+      if (!path || !sha || !settings.token) throw new Error("No tracked remote revision or token");
+      const accepted = await new Promise<boolean>(resolve => {
+        new PublishConfirmModal(this.app, path, true, [], resolve, true).open();
+      });
+      if (!accepted) return;
+      if (file.path !== source) throw new Error("Note moved during confirmation; retry");
+      const {owner, repo, branch, token} = settings;
+      const response = await requestUrl({
+        url: "https://api.github.com/repos/" + encodeURIComponent(owner) + "/" + encodeURIComponent(repo) + "/contents/" + path.split("/").map(encodeURIComponent).join("/"),
+        method: "DELETE",
+        headers: {Authorization: "Bearer " + token, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
+        body: JSON.stringify({message: "postly: withdraw " + path, sha, branch}),
+        throw: false,
+      });
+      if (response.status !== 200) throw new Error("GitHub withdrawal failed (" + response.status + "); verify remote revision");
+      const currentKey = this.publicationKey(settings, file.path);
+      const shas = {...this.settings.publishedShas};
+      delete shas[currentKey];
+      this.settings.publishedShas = shas;
+      this.settings.withdrawnPaths = {...this.settings.withdrawnPaths, [currentKey]: true};
+      await this.saveSettings();
+      new Notice("postly: article withdrawn from branch; deployment not verified. Git history and shared assets remain.");
+    } catch (e) {
+      new Notice("postly: withdrawal failed — " + String(e));
+    } finally {
+      this.publishing = false;
+    }
+  }
+
   private async reconcileRename(oldPath: string, newPath: string) {
     const paths = { ...this.settings.publishedPaths };
     const shas = { ...this.settings.publishedShas };
+    const withdrawn = { ...this.settings.withdrawnPaths };
     let changed = false;
     for (const key of Object.keys(paths)) {
       const parts = JSON.parse(key) as string[];
@@ -82,11 +138,14 @@ export default class PostlyPlugin extends Plugin {
       if (shas[key]) shas[replacement] = shas[key];
       delete paths[key];
       delete shas[key];
+      if (withdrawn[key]) withdrawn[replacement] = true;
+      delete withdrawn[key];
       changed = true;
     }
     if (changed) {
       this.settings.publishedPaths = paths;
       this.settings.publishedShas = shas;
+      this.settings.withdrawnPaths = withdrawn;
       await this.saveSettings();
     }
   }
@@ -109,20 +168,24 @@ export default class PostlyPlugin extends Plugin {
       const sourcePath = file.path;
       const key = JSON.stringify([settings.owner, settings.repo, settings.branch, dir, sourcePath]);
       const existing = settings.publishedPaths?.[key];
+      const withdrawn = Boolean(settings.withdrawnPaths?.[key]);
       const now = new Date();
       const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
       const name = /^\d{4}-\d{2}-\d{2}-/.test(file.name) ? file.name : date + "-" + file.name;
       const path = existing ?? dir + "/" + name;
       const prepared = await this.prepareAssets(this.normalize(view.editor.getValue(), file.name), sourcePath);
       const accepted = await new Promise<boolean>(resolve => {
-        new PublishConfirmModal(this.app, path, Boolean(existing), prepared.assets.map(a => a.source), resolve).open();
+        new PublishConfirmModal(this.app, path, Boolean(existing && !withdrawn), prepared.assets.map(a => a.source), resolve).open();
       });
       if (!accepted) return;
       if (file.path !== sourcePath) throw new Error("Note moved during confirmation; retry publication");
-      const result = await this.putContents(path, prepared.body, prepared.assets, settings, settings.publishedShas?.[key], Boolean(existing));
+      const result = await this.putContents(path, prepared.body, prepared.assets, settings, settings.publishedShas?.[key], Boolean(existing && !withdrawn));
       const currentKey = JSON.stringify([settings.owner, settings.repo, settings.branch, dir, file.path]);
       this.settings.publishedPaths = { ...this.settings.publishedPaths, [currentKey]: path };
       this.settings.publishedShas = { ...this.settings.publishedShas, [currentKey]: result.sha };
+      const withdrawnPaths = {...this.settings.withdrawnPaths};
+      delete withdrawnPaths[currentKey];
+      this.settings.withdrawnPaths = withdrawnPaths;
       await this.saveSettings();
       new Notice(`postly: committed ✓ ${result.url ?? ""} (site deployment not verified)`);
     } catch (e) {
@@ -234,20 +297,20 @@ function encodeBytes(bytes: Uint8Array): string {
 
 class PublishConfirmModal extends Modal {
   private accepted = false;
-  constructor(app: App, private path: string, private update: boolean, private assets: string[], private resolve: (value: boolean) => void) {
+  constructor(app: App, private path: string, private update: boolean, private assets: string[], private resolve: (value: boolean) => void, private withdraw = false) {
     super(app);
   }
   onOpen() {
-    this.contentEl.createEl("h2", { text: this.update ? "Update public article?" : "Publish public article?" });
+    this.contentEl.createEl("h2", { text: this.withdraw ? "Withdraw public article?" : this.update ? "Update public article?" : "Publish public article?" });
     this.contentEl.createEl("p", { text: this.path });
-    this.contentEl.createEl("p", { text: "The current note will be sent to GitHub. Review its contents before publishing. Only listed standalone image embeds are included." });
+    this.contentEl.createEl("p", { text: this.withdraw ? "Remove the tracked article from the remote branch. The local note, shared attachments, Git history and cached copies remain." : "The current note will be sent to GitHub. Review its contents before publishing. Only listed standalone image embeds are included." });
     if (this.assets.length) {
       const list = this.contentEl.createEl("ul");
       for (const source of this.assets) list.createEl("li", {text: source});
     }
     new Setting(this.contentEl)
       .addButton(b => b.setButtonText("Cancel").onClick(() => this.close()))
-      .addButton(b => b.setButtonText("Publish").setCta().onClick(() => { this.accepted = true; this.close(); }));
+      .addButton(b => b.setButtonText(this.withdraw ? "Withdraw" : "Publish").setCta().onClick(() => { this.accepted = true; this.close(); }));
   }
   onClose() {
     this.contentEl.empty();
