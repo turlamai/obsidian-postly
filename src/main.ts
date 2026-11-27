@@ -8,7 +8,7 @@
 //   2. ensure the title: if the body has no H1, one is derived from the file
 //      name so the engine's title rule has something to find.
 
-import { App, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from "obsidian";
+import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, requestUrl } from "obsidian";
 
 interface PostlySettings {
   owner: string;
@@ -18,6 +18,9 @@ interface PostlySettings {
   targetDir: string;
   token: string;
   stripFrontmatter: boolean;
+  publishedPaths?: Record<string, string>;
+  publishedShas?: Record<string, string>;
+  withdrawnPaths?: Record<string, boolean>;
 }
 
 const DEFAULT_SETTINGS: PostlySettings = {
@@ -32,6 +35,8 @@ const DEFAULT_SETTINGS: PostlySettings = {
 export default class PostlyPlugin extends Plugin {
   settings: PostlySettings = DEFAULT_SETTINGS;
 
+  private publishing = false;
+
   async onload() {
     await this.loadSettings();
     this.addCommand({
@@ -39,11 +44,28 @@ export default class PostlyPlugin extends Plugin {
       name: "Push current note to postly blog",
       checkCallback: (checking: boolean) => {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!view) return false;
+        if (!view?.file || this.publishing) return false;
         if (!checking) void this.pushCurrentNote(view);
         return true;
       },
     });
+    this.addCommand({
+      id: "withdraw-current-note",
+      name: "Withdraw current note from postly blog",
+      checkCallback: (checking: boolean) => {
+        const file = this.app.workspace.getActiveViewOfType(MarkdownView)?.file;
+        if (!file || this.publishing) return false;
+        const key = this.publicationKey(this.settings, file.path);
+        if (!this.settings.publishedPaths?.[key] || !this.settings.publishedShas?.[key]) return false;
+        if (!checking) void this.withdrawCurrentNote(file);
+        return true;
+      },
+    });
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      void this.reconcileRename(oldPath, file.path).catch(() => {
+        new Notice("postly: could not save renamed publication mapping");
+      });
+    }));
     this.addSettingTab(new PostlySettingTab(this.app, this));
   }
 
@@ -55,6 +77,79 @@ export default class PostlyPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  private publicationKey(settings: PostlySettings, source: string): string {
+    return JSON.stringify([settings.owner, settings.repo, settings.branch, settings.targetDir.replace(/^\/+|\/+$/g, ""), source]);
+  }
+
+  private async withdrawCurrentNote(file: TFile) {
+    if (this.publishing) return;
+    this.publishing = true;
+    try {
+      const settings = { ...this.settings };
+      const source = file.path;
+      const key = this.publicationKey(settings, source);
+      const path = settings.publishedPaths?.[key];
+      const sha = settings.publishedShas?.[key];
+      if (!path || !sha || !settings.token) throw new Error("No tracked remote revision or token");
+      const accepted = await new Promise<boolean>(resolve => {
+        new PublishConfirmModal(this.app, path, true, [], resolve, true).open();
+      });
+      if (!accepted) return;
+      if (file.path !== source) throw new Error("Note moved during confirmation; retry");
+      const {owner, repo, branch, token} = settings;
+      const response = await requestUrl({
+        url: "https://api.github.com/repos/" + encodeURIComponent(owner) + "/" + encodeURIComponent(repo) + "/contents/" + path.split("/").map(encodeURIComponent).join("/"),
+        method: "DELETE",
+        headers: {Authorization: "Bearer " + token, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
+        body: JSON.stringify({message: "postly: withdraw " + path, sha, branch}),
+        throw: false,
+      });
+      if (response.status !== 200) throw new Error("GitHub withdrawal failed (" + response.status + "); verify remote revision");
+      const currentKey = this.publicationKey(settings, file.path);
+      const shas = {...this.settings.publishedShas};
+      delete shas[currentKey];
+      this.settings.publishedShas = shas;
+      this.settings.withdrawnPaths = {...this.settings.withdrawnPaths, [currentKey]: true};
+      await this.saveSettings();
+      new Notice("postly: article withdrawn from branch; deployment not verified. Git history and shared assets remain.");
+    } catch (e) {
+      new Notice("postly: withdrawal failed — " + String(e));
+    } finally {
+      this.publishing = false;
+    }
+  }
+
+  private async reconcileRename(oldPath: string, newPath: string) {
+    const paths = { ...this.settings.publishedPaths };
+    const shas = { ...this.settings.publishedShas };
+    const withdrawn = { ...this.settings.withdrawnPaths };
+    let changed = false;
+    for (const key of Object.keys(paths)) {
+      const parts = JSON.parse(key) as string[];
+      const source = parts[4];
+      if (source !== oldPath && !source.startsWith(oldPath + "/")) continue;
+      parts[4] = newPath + source.slice(oldPath.length);
+      const replacement = JSON.stringify(parts);
+      if (paths[replacement] !== undefined) {
+        new Notice("postly: rename conflicts with another publication mapping");
+        continue;
+      }
+      paths[replacement] = paths[key];
+      if (shas[key]) shas[replacement] = shas[key];
+      delete paths[key];
+      delete shas[key];
+      if (withdrawn[key]) withdrawn[replacement] = true;
+      delete withdrawn[key];
+      changed = true;
+    }
+    if (changed) {
+      this.settings.publishedPaths = paths;
+      this.settings.publishedShas = shas;
+      this.settings.withdrawnPaths = withdrawn;
+      await this.saveSettings();
+    }
+  }
+
   private async pushCurrentNote(view: MarkdownView) {
     const file = view.file;
     if (!file) return;
@@ -62,15 +157,41 @@ export default class PostlyPlugin extends Plugin {
       new Notice("postly: set owner / repo / token in settings first");
       return;
     }
-    const raw = await this.app.vault.read(file);
-    const body = this.normalize(raw, file.name);
-    const path = `${this.settings.targetDir}/${file.name}`;
+    if (this.publishing) return;
+    this.publishing = true;
     try {
-      new Notice(`postly: pushing ${file.name}…`);
-      const url = await this.putContents(path, body);
-      new Notice(`postly: pushed ✓ ${url ?? ""}`);
+      const settings = { ...this.settings };
+      const dir = settings.targetDir.replace(/^\/+|\/+$/g, "");
+      if (dir.split("/").some(part => !part || part === "." || part === "..")) {
+        throw new Error("Invalid target directory");
+      }
+      const sourcePath = file.path;
+      const key = JSON.stringify([settings.owner, settings.repo, settings.branch, dir, sourcePath]);
+      const existing = settings.publishedPaths?.[key];
+      const withdrawn = Boolean(settings.withdrawnPaths?.[key]);
+      const now = new Date();
+      const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
+      const name = /^\d{4}-\d{2}-\d{2}-/.test(file.name) ? file.name : date + "-" + file.name;
+      const path = existing ?? dir + "/" + name;
+      const prepared = await this.prepareAssets(this.normalize(view.editor.getValue(), file.name), sourcePath);
+      const accepted = await new Promise<boolean>(resolve => {
+        new PublishConfirmModal(this.app, path, Boolean(existing && !withdrawn), prepared.assets.map(a => a.source), resolve).open();
+      });
+      if (!accepted) return;
+      if (file.path !== sourcePath) throw new Error("Note moved during confirmation; retry publication");
+      const result = await this.putContents(path, prepared.body, prepared.assets, settings, settings.publishedShas?.[key], Boolean(existing && !withdrawn));
+      const currentKey = JSON.stringify([settings.owner, settings.repo, settings.branch, dir, file.path]);
+      this.settings.publishedPaths = { ...this.settings.publishedPaths, [currentKey]: path };
+      this.settings.publishedShas = { ...this.settings.publishedShas, [currentKey]: result.sha };
+      const withdrawnPaths = {...this.settings.withdrawnPaths};
+      delete withdrawnPaths[currentKey];
+      this.settings.withdrawnPaths = withdrawnPaths;
+      await this.saveSettings();
+      new Notice(`postly: committed ✓ ${result.url ?? ""} (site deployment not verified)`);
     } catch (e) {
       new Notice(`postly: push failed — ${String(e)}`);
+    } finally {
+      this.publishing = false;
     }
   }
 
@@ -87,38 +208,113 @@ export default class PostlyPlugin extends Plugin {
     return body;
   }
 
-  /** GitHub Contents API PUT; returns the commit HTML URL when present. */
-  private async putContents(path: string, content: string): Promise<string | undefined> {
-    const { owner, repo, branch, token } = this.settings;
-    const api = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
-    const headers = {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "Content-Type": "application/json",
-    };
-
-    let sha: string | undefined;
-    const get = await requestUrl({ url: `${api}?ref=${branch}`, headers, throw: false });
-    if (get.status === 200) sha = get.json?.sha;
-    else if (get.status !== 404) throw new Error(`GitHub GET ${get.status}`);
-
-    const put = await requestUrl({
-      url: api,
-      method: "PUT",
-      headers,
-      body: JSON.stringify({
-        message: `postly: publish ${path}`,
-        content: btoa(unescape(encodeURIComponent(content))),
-        branch,
-        ...(sha ? { sha } : {}),
-      }),
-      throw: false,
-    });
-    if (put.status >= 200 && put.status < 300) {
-      return put.json?.commit?.html_url;
+  // Initial attachment support: standalone Obsidian image embeds outside fenced code.
+  // Never traverse linked notes or upload unsupported file types.
+  private async prepareAssets(body: string, sourcePath: string): Promise<{body: string; assets: PublicAsset[]}> {
+    const assets = new Map<string, PublicAsset>();
+    const lines = body.split("\n");
+    let fence: string | undefined;
+    let total = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const marker = lines[i].match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (marker) {
+        if (!fence) fence = marker[1];
+        else if (marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = undefined;
+        continue;
+      }
+      if (fence) continue;
+      const match = lines[i].match(/^ {0,3}!\[\[([^\]#|]+)(?:\|([^\]]+))?\]\]\s*$/);
+      if (!match) continue;
+      const target = this.app.metadataCache.getFirstLinkpathDest(match[1], sourcePath);
+      if (!(target instanceof TFile) || !/^(png|jpe?g|gif|webp|avif)$/i.test(target.extension)) {
+        throw new Error("Unsupported or missing standalone image embed: " + match[1]);
+      }
+      if (target.stat.size > 10 * 1024 * 1024) throw new Error("Image exceeds 10 MiB: " + target.path);
+      const bytes = new Uint8Array(await this.app.vault.readBinary(target));
+      if (bytes.length > 10 * 1024 * 1024) throw new Error("Image exceeds 10 MiB: " + target.path);
+      const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)), b => b.toString(16).padStart(2, "0")).join("");
+      const path = "assets/" + digest + "." + target.extension.toLowerCase();
+      if (!assets.has(path)) {
+        total += bytes.length;
+        if (total > 30 * 1024 * 1024) throw new Error("Total images exceed 30 MiB");
+        assets.set(path, {path, source: target.path, content: encodeBytes(bytes)});
+      }
+      lines[i] = "![](/" + path + ")";
     }
-    throw new Error(`GitHub PUT ${put.status}: ${put.text?.slice(0, 200)}`);
+    return {body: lines.join("\n"), assets: Array.from(assets.values())};
+  }
+
+  /** Publish article and assets in one non-forced Git ref update. */
+  private async putContents(path: string, content: string, assets: PublicAsset[], settings: PostlySettings, expectedSha: string | undefined, known: boolean): Promise<{ sha: string; url?: string }> {
+    const { owner, repo, branch, token } = settings;
+    const base = "https://api.github.com/repos/" + encodeURIComponent(owner) + "/" + encodeURIComponent(repo);
+    const headers = {Authorization: "Bearer " + token, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"};
+    const api = async (method: string, suffix: string, body?: unknown) => {
+      const response = await requestUrl({url: base + suffix, method, headers, ...(body === undefined ? {} : {body: JSON.stringify(body)}), throw: false});
+      if (response.status < 200 || response.status >= 300) throw new Error("GitHub " + method + " " + response.status);
+      return response.json;
+    };
+    const ref = branch.split("/").map(encodeURIComponent).join("/");
+    const parent = (await api("GET", "/git/ref/heads/" + ref)).object.sha;
+    const tree = (await api("GET", "/git/commits/" + parent)).tree.sha;
+    const snapshot = await api("GET", "/git/trees/" + tree + "?recursive=1");
+    if (snapshot.truncated) throw new Error("Repository tree too large to verify safely");
+    const entries = new Map<string, {sha: string; type: string; mode: string}>();
+    for (const entry of snapshot.tree) entries.set(entry.path, entry);
+    const current = entries.get(path);
+    if (known ? !current || current.type !== "blob" || current.mode !== "100644" || !expectedSha || current.sha !== expectedSha : Boolean(current)) {
+      throw new Error("Remote article conflicts with the recorded publication");
+    }
+    const changes: {path: string; mode: string; type: string; sha: string}[] = [];
+    const stage = async (target: string, encoded: string, immutable: boolean) => {
+      const blob = await api("POST", "/git/blobs", {content: encoded, encoding: "base64"});
+      const previous = entries.get(target);
+      if (previous && (previous.type !== "blob" || previous.mode !== "100644" || (immutable && previous.sha !== blob.sha))) {
+        throw new Error("Unexpected existing asset: " + target);
+      }
+      if (previous?.sha !== blob.sha) changes.push({path: target, mode: "100644", type: "blob", sha: blob.sha});
+      return blob.sha as string;
+    };
+    for (const asset of assets) await stage(asset.path, asset.content, true);
+    const sha = await stage(path, encodeBytes(new TextEncoder().encode(content)), false);
+    if (!changes.length) return {sha};
+    const nextTree = await api("POST", "/git/trees", {base_tree: tree, tree: changes});
+    const commit = await api("POST", "/git/commits", {message: "postly: publish " + path, tree: nextTree.sha, parents: [parent]});
+    await api("PATCH", "/git/refs/heads/" + ref, {sha: commit.sha, force: false});
+    return {sha, url: "https://github.com/" + owner + "/" + repo + "/commit/" + commit.sha};
+  }
+}
+
+interface PublicAsset { path: string; source: string; content: string; }
+
+function encodeBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  }
+  return btoa(binary);
+}
+
+class PublishConfirmModal extends Modal {
+  private accepted = false;
+  constructor(app: App, private path: string, private update: boolean, private assets: string[], private resolve: (value: boolean) => void, private withdraw = false) {
+    super(app);
+  }
+  onOpen() {
+    this.contentEl.createEl("h2", { text: this.withdraw ? "Withdraw public article?" : this.update ? "Update public article?" : "Publish public article?" });
+    this.contentEl.createEl("p", { text: this.path });
+    this.contentEl.createEl("p", { text: this.withdraw ? "Remove the tracked article from the remote branch. The local note, shared attachments, Git history and cached copies remain." : "The current note will be sent to GitHub. Review its contents before publishing. Only listed standalone image embeds are included." });
+    if (this.assets.length) {
+      const list = this.contentEl.createEl("ul");
+      for (const source of this.assets) list.createEl("li", {text: source});
+    }
+    new Setting(this.contentEl)
+      .addButton(b => b.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton(b => b.setButtonText(this.withdraw ? "Withdraw" : "Publish").setCta().onClick(() => { this.accepted = true; this.close(); }));
+  }
+  onClose() {
+    this.contentEl.empty();
+    this.resolve(this.accepted);
   }
 }
 
