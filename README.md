@@ -1,33 +1,30 @@
-# obsidian-postly
+# Obsidian Postly
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+**English** · [简体中文](README.zh-CN.md)
 
-A deliberately thin Obsidian plugin: push the current note's **pure
-Markdown** to a [postly](https://github.com/turlamai/postly) blog repository
-via the GitHub Contents API.
+Publish selected notes from Obsidian to a GitHub content branch. [Postly](https://github.com/turlamai/postly) builds the public site from that branch.
 
-One command: **"Push current note to postly blog"**. The plugin never
-transforms content beyond two normalizations that keep the file
-editor-neutral — stripping YAML frontmatter (vault-local by design; the blog
-never depends on it) and deriving an H1 title from the filename when the body
-has none. Everything else is pushed byte-for-byte; the postly engine does all
-rendering on the build side.
+## Install
 
-## Identity
+Download `main.js` and `manifest.json` from [GitHub Releases](https://github.com/turlamai/obsidian-postly/releases). Copy both into `.obsidian/plugins/postly-publisher/` in your vault. Reload Obsidian and enable **postly publisher** under Community plugins. The plugin ID is `postly-publisher`.
 
-The repository and plugin id intentionally differ: the Obsidian manifest id
-is `postly-publisher` (set at first publication — changing it would orphan
-existing installs), while the repository/package name is `obsidian-postly`,
-matching its sibling naming (`obsidian` is the Racket Markdown library this
-plugin does not depend on). The display name is "postly publisher".
+## Configure
 
-## Setup
+In **Settings → postly publisher**, enter the GitHub owner, repository, existing content branch and the target directory `blog`. Create a fine-grained GitHub token with **Contents read/write** for only that repository. The plugin sends the token to GitHub and stores it in the vault's plugin settings. Keep that settings file private.
 
-1. Settings → postly publisher: repository owner/name, branch, target
-   directory (`blog` for posts), and a fine-grained PAT with Contents
-   read/write on that repository only.
-2. Run the command from the note you want to publish.
+For the TurLamAI portal, use owner `turlamai`, repository `turlamai.github.io`, branch `articles-content` and target directory `blog`.
 
-## License
+## Publish, update or withdraw
 
-MIT — see `LICENSE`.
+- Open a note and run **Push current note to postly blog**. Review the destination and listed images before confirming. The plugin strips YAML frontmatter by default and inserts an H1 from the filename when needed.
+- Put each local image embed on its own line, for example `![[diagram.png]]`. PNG, JPEG, GIF, WebP and AVIF are supported, with a 10 MiB limit per image and 30 MiB per publication. The article and its staged images are committed together. Review other Markdown links and embeds before publishing.
+- Run the same command to update a tracked article, including after renaming the local note. Updates reuse the original dated path. The plugin rejects changes when the remote article differs from its recorded revision.
+- Run **Withdraw current note from postly blog** to remove the tracked article from the content branch. The local note, shared images, Git history and cached copies remain. The site build must replace the previous published output to remove the article page, RSS entry and sitemap entry.
+
+A successful command confirms a GitHub commit. Check the public site after its build runs. Keep the vault's publication mappings if you reinstall or move to another device.
+
+## Build from source
+
+Run `npm ci`, `npx tsc --noEmit` and `npm run build`. Install the resulting `main.js` with `manifest.json` as above.
+
+MIT · [License](LICENSE)
